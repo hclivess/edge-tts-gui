@@ -51,6 +51,13 @@ Double-click a queue item to open the source file, or to edit pasted text.
 The GitHub workflow builds Windows / Linux / macOS on every tag and attaches them to the release; the Linux build runs a
 headless self-test (`EDGE_TTS_GUI_SELFTEST=<text file>`).
 
+## Changes in 2.0.1
+
+- No partial audio files: audio chunks stream into `<name>.part.mp3`, conversions and subtitles are written to a temp name and renamed into place only when complete; Stop or a network error removes the temp
+- Helper processes (ffmpeg, open-folder) are tracked and killed on Stop, on quit and when the app dies (Windows Job object, Linux PR_SET_PDEATHSIG)
+- Adding files or folders rejects paths already in the queue ("n already in queue")
+- Folder scans, the queue and the preset list use natural sort order (`ch2` before `ch10`)
+
 ## Changes in 2.0
 
 - Complete rewrite as a batch tool: queue of files / texts instead of a single text box, per-item status, log, presets

@@ -7,7 +7,6 @@ Set EDGE_TTS_GUI_SELFTEST=<text file> for a headless smoke test (synthesize it, 
 """
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -29,6 +28,8 @@ from PySide6.QtWidgets import (  # noqa: E402
 from config import (APP_NAME, APP_VERSION, AUDIO_FORMATS, BOUNDARIES, DEFAULT_SETTINGS, DEFAULT_VOICE,  # noqa: E402
                     SPLIT_METHODS, SUBTITLE_FORMATS, TEXT_EXTENSIONS, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH)
 from tts_engine import Synthesizer, app_dir, find_ffmpeg, list_voices, read_text_file, split_text, voice_display  # noqa: E402
+from utils import childproc  # noqa: E402
+from utils.naturalsort import natural_sorted  # noqa: E402
 
 _BTN = """
     QPushButton { font-size: 14px; font-weight: bold; padding: 8px; background-color: %s; color: %s; border-radius: 5px; }
@@ -85,14 +86,18 @@ class Worker(QThread):
         self.items = items
         self.settings = settings
         self._stop = False
+        self._synth: Optional[Synthesizer] = None
 
     def request_stop(self):
         self._stop = True
+        if self._synth:
+            self._synth.stop()
 
     def run(self):
         ok = 0
         synth = Synthesizer(self.settings, log=self.log.emit, progress=self.item_progress.emit,
                             should_stop=lambda: self._stop)
+        self._synth = synth
         for i, item in enumerate(self.items):
             if self._stop:
                 self.item_done.emit(i, "stopped", "")
@@ -520,8 +525,8 @@ class MainWindow(QMainWindow):
         for key, p in PRESETS.items():
             m.addAction(p["name"], lambda k=key: self._apply_preset(k))
         m.addSeparator()
-        user = sorted(f[:-5] for f in os.listdir(self.presets_dir)
-                      if f.endswith(".json") and f not in ("defaults.json", "voices_cache.json"))
+        user = natural_sorted(f[:-5] for f in os.listdir(self.presets_dir)
+                              if f.endswith(".json") and f not in ("defaults.json", "voices_cache.json"))
         for name in user:
             m.addAction(name, lambda n=name: self._load_preset_file(os.path.join(self.presets_dir, n + ".json")))
         if user:
@@ -626,8 +631,8 @@ class MainWindow(QMainWindow):
             self._rebuild_presets_menu()
 
     def _delete_preset(self):
-        user = sorted(f[:-5] for f in os.listdir(self.presets_dir)
-                      if f.endswith(".json") and f not in ("defaults.json", "voices_cache.json"))
+        user = natural_sorted(f[:-5] for f in os.listdir(self.presets_dir)
+                              if f.endswith(".json") and f not in ("defaults.json", "voices_cache.json"))
         if not user:
             QMessageBox.information(self, "Presets", "No saved presets.")
             return
@@ -767,22 +772,38 @@ class MainWindow(QMainWindow):
             self._add_item(QueueItem(text=text, title=f"dropped text {len(self.items) + 1}"))
 
     def add_paths(self, paths: List[str]):
-        n = 0
+        n = dup = 0
         for p in paths:
             path = Path(p)
             if path.is_dir():
-                for f in sorted(path.rglob("*")):
-                    # folder scans skip .srt so our own subtitle outputs are never re-queued
-                    if f.suffix.lower() in TEXT_EXTENSIONS and f.suffix.lower() != ".srt":
-                        n += self._add_item(QueueItem(path=str(f)))
+                # folder scans skip .srt so our own subtitle outputs are never re-queued; natural order (ch2 < ch10)
+                files = [str(f) for f in path.rglob("*")
+                         if f.is_file() and f.suffix.lower() in TEXT_EXTENSIONS and f.suffix.lower() != ".srt"]
+                for f in natural_sorted(files):
+                    added = self._add_item(QueueItem(path=f))
+                    n += added
+                    dup += 1 - added
             elif path.is_file() and path.suffix.lower() in TEXT_EXTENSIONS:
-                n += self._add_item(QueueItem(path=str(path)))
+                added = self._add_item(QueueItem(path=str(path)))
+                n += added
+                dup += 1 - added
+        msg = []
         if n:
-            self.statusBar().showMessage(f"{n} item(s) added — {len(self.items)} in queue")
+            msg.append(f"{n} item(s) added")
+        if dup:
+            msg.append(f"{dup} already in queue")
+        if msg:
+            self.statusBar().showMessage(f"{', '.join(msg)} — {len(self.items)} in queue")
+
+    @staticmethod
+    def _norm(path: str) -> str:
+        return os.path.normcase(os.path.abspath(path))
 
     def _add_item(self, item: QueueItem) -> int:
-        if item.path and any(i.path == item.path for i in self.items):
-            return 0
+        if item.path:
+            key = self._norm(item.path)
+            if any(i.path and self._norm(i.path) == key for i in self.items):
+                return 0
         self.items.append(item)
         r = self.table.rowCount()
         self.table.insertRow(r)
@@ -857,9 +878,9 @@ class MainWindow(QMainWindow):
             if sys.platform == "win32":
                 os.startfile(path)  # noqa
             elif sys.platform == "darwin":
-                subprocess.Popen(["open", path])
+                childproc.popen(["open", path])
             else:
-                subprocess.Popen(["xdg-open", path])
+                childproc.popen(["xdg-open", path])
         except Exception as exc:
             QMessageBox.information(self, "Open", f"{path}\n\n({exc})")
 
@@ -973,6 +994,7 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    childproc.install_qt_hook(app)
     app.setStyle("Fusion")
     icon = os.path.join(app_dir(), "icon.ico")
     if os.path.exists(icon):

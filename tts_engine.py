@@ -15,8 +15,34 @@ from typing import Callable, Dict, List, Optional
 import edge_tts
 
 from config import MAX_CHUNK_CHARS
+from utils import childproc
 
-_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+def part_name(path: str) -> str:
+    """Temporary name next to the destination: out.mp3 -> out.part.mp3. Never leave a partial file under the final name."""
+    base, ext = os.path.splitext(path)
+    return f"{base}.part{ext}"
+
+
+def write_atomic(path: str, data, mode: str = "w", encoding: Optional[str] = "utf-8") -> str:
+    """Write to <name>.part.<ext> and os.replace into place once complete."""
+    tmp = part_name(path)
+    try:
+        with open(tmp, mode, encoding=encoding if "b" not in mode else None) as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        _remove(tmp)
+        raise
+    return path
+
+
+def _remove(path: str) -> None:
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
 
 
 def app_dir() -> str:
@@ -198,6 +224,13 @@ class Synthesizer:
         self.log = log
         self.progress = progress
         self.should_stop = should_stop
+        self._proc = None
+
+    def stop(self):
+        """Kill a running ffmpeg conversion (the caller sets its stop flag first; temp outputs are removed)."""
+        proc = self._proc
+        if proc is not None:
+            childproc.kill(proc)
 
     # -- one chunk --------------------------------------------------------------
     async def _synth_chunk(self, text: str) -> (bytes, List[Cue]):
@@ -247,27 +280,32 @@ class Synthesizer:
         if len(chunks) > 1:
             self.log(f"{len(chunks)} chunks of up to {self.s.get('chunk_chars', MAX_CHUNK_CHARS)} characters")
         pause_ms = int(self.s.get("pause_between_chunks_ms", 0) or 0)
-        audio = bytearray()
-        cues: List[Cue] = []
-        offset = 0.0
-        for i, chunk in enumerate(chunks, 1):
-            self.progress(i - 1, len(chunks))
-            data, chunk_cues = self._synth_chunk_retry(chunk, f"chunk {i}/{len(chunks)}")
-            audio += data
-            for c in chunk_cues:
-                cues.append(Cue(c.start_ms + offset, c.end_ms + offset, c.text))
-            dur = mp3_duration_ms(data)
-            offset += dur
-            if pause_ms and i < len(chunks):
-                silence = self._silence_mp3(pause_ms)
-                audio += silence
-                offset += pause_ms
-            self.progress(i, len(chunks))
-
         fmt = self.s.get("format", "mp3")
         mp3_path = out_base + ".mp3"
-        with open(mp3_path, "wb") as fh:
-            fh.write(audio)
+        mp3_tmp = part_name(mp3_path)
+        cues: List[Cue] = []
+        offset = 0.0
+        # audio chunks are appended to <name>.part.mp3 as they arrive; the file only gets its final name when complete
+        try:
+            with open(mp3_tmp, "wb") as fh:
+                for i, chunk in enumerate(chunks, 1):
+                    self.progress(i - 1, len(chunks))
+                    data, chunk_cues = self._synth_chunk_retry(chunk, f"chunk {i}/{len(chunks)}")
+                    fh.write(data)
+                    for c in chunk_cues:
+                        cues.append(Cue(c.start_ms + offset, c.end_ms + offset, c.text))
+                    offset += mp3_duration_ms(data)
+                    if pause_ms and i < len(chunks):
+                        fh.write(self._silence_mp3(pause_ms))
+                        offset += pause_ms
+                    self.progress(i, len(chunks))
+            if self.should_stop():
+                raise InterruptedError("stopped")
+            os.replace(mp3_tmp, mp3_path)
+        except BaseException:
+            _remove(mp3_tmp)
+            raise
+
         audio_path = mp3_path
         if fmt != "mp3":
             audio_path = self._convert(mp3_path, out_base + "." + fmt)
@@ -276,13 +314,9 @@ class Synthesizer:
         subs = []
         mode = self.s.get("subtitles", "none")
         if cues and mode in ("srt", "both"):
-            p = out_base + ".srt"
-            open(p, "w", encoding="utf-8").write(cues_to_srt(cues))
-            subs.append(p)
+            subs.append(write_atomic(out_base + ".srt", cues_to_srt(cues)))
         if cues and mode in ("vtt", "both"):
-            p = out_base + ".vtt"
-            open(p, "w", encoding="utf-8").write(cues_to_vtt(cues))
-            subs.append(p)
+            subs.append(write_atomic(out_base + ".vtt", cues_to_vtt(cues)))
         return SynthResult(audio_path, subs, len(chunks), offset)
 
     _silence_cache: Dict[int, bytes] = {}
@@ -296,9 +330,8 @@ class Synthesizer:
             self.log("ffmpeg not found - pause between chunks skipped")
             self._silence_cache[ms] = b""
             return b""
-        res = subprocess.run([ff, "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono", "-t", f"{ms / 1000:.3f}",
-                              "-c:a", "libmp3lame", "-b:a", "48k", "-f", "mp3", "-"],
-                             capture_output=True, creationflags=_CREATE_NO_WINDOW)
+        res = childproc.run([ff, "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono", "-t", f"{ms / 1000:.3f}",
+                             "-c:a", "libmp3lame", "-b:a", "48k", "-f", "mp3", "-"])
         data = res.stdout if res.returncode == 0 else b""
         self._silence_cache[ms] = data
         return data
@@ -308,11 +341,23 @@ class Synthesizer:
         if not ff:
             self.log(f"ffmpeg not found - keeping mp3 instead of {os.path.splitext(dst)[1]}")
             return src
-        res = subprocess.run([ff, "-y", "-v", "error", "-i", src, dst], capture_output=True, text=True,
-                             creationflags=_CREATE_NO_WINDOW)
-        if res.returncode != 0:
-            self.log(f"conversion failed ({res.stderr.strip()[:200]}) - keeping mp3")
+        tmp = part_name(dst)
+        proc = childproc.popen([ff, "-y", "-v", "error", "-i", src, tmp], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
+        self._proc = proc
+        try:
+            _, err = proc.communicate()
+        finally:
+            self._proc = None
+            childproc.forget(proc)
+        if self.should_stop():
+            _remove(tmp)
+            raise InterruptedError("stopped")
+        if proc.returncode != 0:
+            _remove(tmp)
+            self.log(f"conversion failed ({(err or '').strip()[:200]}) - keeping mp3")
             return src
+        os.replace(tmp, dst)
         return dst
 
 

@@ -3,7 +3,7 @@ edge-tts-gui - configuration and constants
 """
 
 APP_NAME = "edge-tts-gui"
-APP_VERSION = "2.0"
+APP_VERSION = "2.0.1"
 WINDOW_MIN_WIDTH = 900
 WINDOW_MIN_HEIGHT = 600
 
