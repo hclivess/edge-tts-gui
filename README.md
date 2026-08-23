@@ -51,6 +51,14 @@ Double-click a queue item to open the source file, or to edit pasted text.
 The GitHub workflow builds Windows / Linux / macOS on every tag and attaches them to the release; the Linux build runs a
 headless self-test (`EDGE_TTS_GUI_SELFTEST=<text file>`).
 
+## Changes in 2.0.2
+
+- **The Windows taskbar shows the app's own icon.** The taskbar button takes its icon from the process's
+  Application User Model ID rather than from the window, and with none of its own the process was grouped
+  under whatever launched it and wore that program's icon. One is now set before any window exists, and it
+  carries no version number so a pinned button survives an upgrade.
+
+
 ## Changes in 2.0.1
 
 - No partial audio files: audio chunks stream into `<name>.part.mp3`, conversions and subtitles are written to a temp name and renamed into place only when complete; Stop or a network error removes the temp
